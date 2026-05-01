@@ -168,3 +168,16 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_recursive_hermes_chat_guard_blocks_foreground_chat():
+    command = "HERMES_ACCEPT_HOOKS=1 .venv/bin/hermes chat -Q --provider local-mlx-gemma4-4bit -q 'hello'"
+
+    guidance = terminal_tool._recursive_hermes_cli_guidance(command)
+
+    assert guidance
+    assert "Do not invoke `hermes chat` from inside a running Hermes agent" in guidance
+
+
+def test_recursive_hermes_chat_guard_allows_status_commands():
+    assert terminal_tool._recursive_hermes_cli_guidance("hermes status --all") is None

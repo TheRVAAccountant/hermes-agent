@@ -297,12 +297,25 @@ class TestStripThinkBlocks:
     def test_orphaned_closing_think_tag(self, agent):
         result = agent._strip_think_blocks("some reasoning</think>actual answer")
         assert "</think>" not in result
+        assert "some reasoning" not in result
         assert "actual answer" in result
 
     def test_orphaned_closing_thinking_tag(self, agent):
         result = agent._strip_think_blocks("reasoning</thinking>answer")
         assert "</thinking>" not in result
+        assert "reasoning" not in result
         assert "answer" in result
+
+    def test_jangtq_preopened_think_block_removed(self, agent):
+        text = (
+            "Here's a thinking process:\n"
+            "1. Analyze the prompt.\n"
+            "</think>\n\n"
+            "configured-bench-ok"
+        )
+        result = agent._strip_think_blocks(text)
+        assert "thinking process" not in result
+        assert result.strip() == "configured-bench-ok"
 
     def test_orphaned_opening_think_tag(self, agent):
         result = agent._strip_think_blocks("<think>orphaned reasoning without close")
@@ -516,6 +529,12 @@ class TestExtractReasoning:
     def test_inline_reasoning_blocks_fallback(self, agent, content, expected):
         msg = _mock_assistant_msg(content=content)
         assert agent._extract_reasoning(msg) == expected
+
+    def test_jangtq_orphan_close_reasoning_fallback(self, agent):
+        msg = _mock_assistant_msg(
+            content="Thinking Process:\n1. Analyze.\n</think>\n\nconfigured-bench-ok"
+        )
+        assert agent._extract_reasoning(msg) == "Thinking Process:\n1. Analyze."
 
 
 class TestCleanSessionContent:
@@ -2294,6 +2313,30 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_local_empty_after_tool_calls_gets_toolless_final_pass(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:8092/v1"
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="", finish_reason="stop")
+        resp3 = _mock_response(content="Summarized search result", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Summarized search result"
+        assert len(agent.client.chat.completions.create.call_args_list) == 3
+        final_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
+        assert "tools" not in final_kwargs
+        assert final_kwargs["messages"][-1]["role"] == "user"
+        assert "without calling any more tools" in final_kwargs["messages"][-1]["content"]
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

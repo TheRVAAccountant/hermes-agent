@@ -246,6 +246,8 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    server_action: str = ""
+    server_output: str = ""
 
 
 @dataclass
@@ -869,6 +871,27 @@ def switch_model(
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
+    # --- Start backing local server before validation probes /v1/models ---
+    server_action = ""
+    server_output = ""
+    try:
+        from hermes_cli.local_model_servers import find_server_action, start_server_action
+
+        server_action = find_server_action(target_provider, new_model, custom_providers)
+        if server_action:
+            server_result = start_server_action(server_action)
+            server_output = getattr(server_result, "stdout", "") or ""
+    except Exception as e:
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=f"Could not start local model server for '{provider_label}': {e}",
+            server_action=server_action,
+        )
+
     # --- Validate ---
     try:
         validation = validate_requested_model(
@@ -978,6 +1001,8 @@ def switch_model(
         capabilities=capabilities,
         model_info=model_info,
         is_global=is_global,
+        server_action=server_action,
+        server_output=server_output,
     )
 
 

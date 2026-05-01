@@ -2996,7 +2996,7 @@ class AIAgent:
     def _strip_think_blocks(self, content: str) -> str:
         """Remove reasoning/thinking blocks from content, returning only visible text.
 
-        Handles four cases:
+        Handles five cases:
           1. Closed tag pairs (``<think>…</think>``) — the common path when
              the provider emits complete reasoning blocks.
           2. Unterminated open tag at a block boundary (start of text or
@@ -3005,8 +3005,14 @@ class AIAgent:
              of string is stripped.  The block-boundary check mirrors
              ``gateway/stream_consumer.py``'s filter so models that mention
              ``<think>`` in prose aren't over-stripped.
-          3. Stray orphan open/close tags that slip through.
-          4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
+          3. JANGTQ/Qwen pre-opened thinking output where generation starts
+             inside the reasoning block and only emits the closing tag
+             (``reasoning</think>answer``).  The model card documents that
+             ``enable_thinking=True`` makes the model fill a ``<think>`` block;
+             with generation APIs that begin after the opening tag, the visible
+             completion contains the reasoning prefix plus orphan close tag.
+          4. Stray orphan open/close tags that slip through.
+          5. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
              ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
              case-insensitive.
 
@@ -3068,6 +3074,17 @@ class AIAgent:
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
+        # 2b. JANGTQ/Qwen reasoning-on completions can start *inside* the
+        #     template's <think> block and therefore contain only the close
+        #     marker followed by the final answer. Treat text before the first
+        #     orphan close marker as reasoning and keep the answer after it.
+        content = re.sub(
+            r'^.*?</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
+            '',
+            content,
+            count=1,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         # 3. Stray orphan open/close tags that slipped through.
         content = re.sub(
             r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
@@ -3098,6 +3115,41 @@ class AIAgent:
         if stripped.endswith("```"):
             return True
         return stripped[-1] in '.!?:)"\']}。！？：）】」』》'
+
+    @staticmethod
+    def _looks_like_unexecuted_action_plan(content: str) -> bool:
+        """Detect local-model turns that promise tool work instead of doing it."""
+        text = (content or "").strip()
+        if not text:
+            return False
+        lower = text.lower()
+        if lower.startswith("here's a thinking process") or lower.startswith("here is a thinking process"):
+            return True
+        if "understand user request" in lower and "formulate response strategy" in lower:
+            return True
+        markers = (
+            "the user wants",
+            "i need to",
+            "i should",
+            "i will",
+            "i'll",
+            "let me",
+            "i can",
+        )
+        marker_count = sum(lower.count(marker) for marker in markers)
+        if marker_count < 4:
+            return False
+        result_markers = (
+            "here are",
+            "clients:",
+            "completed",
+            "done",
+            "result:",
+            "i found",
+        )
+        if any(marker in lower for marker in result_markers):
+            return False
+        return True
 
     def _is_ollama_glm_backend(self) -> bool:
         """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
@@ -3271,6 +3323,16 @@ class AIAgent:
                 for block in re.findall(pattern, content, flags=flags):
                     cleaned = block.strip()
                     if cleaned and cleaned not in reasoning_parts:
+                        reasoning_parts.append(cleaned)
+            if not reasoning_parts:
+                orphan_close = re.search(
+                    r"^(.*?)</(?:think|thinking|thought|reasoning|REASONING_SCRATCHPAD)>",
+                    content,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                if orphan_close:
+                    cleaned = orphan_close.group(1).strip()
+                    if cleaned:
                         reasoning_parts.append(cleaned)
         
         # Combine all reasoning parts
@@ -8583,6 +8645,21 @@ class AIAgent:
         if isinstance(_san_content, str) and _san_content:
             _san_content = self._strip_think_blocks(_san_content).strip()
 
+        if (
+            isinstance(_san_content, str)
+            and _san_content
+            and self._is_local_chat_completions_endpoint()
+            and not getattr(assistant_message, "tool_calls", None)
+            and self._looks_like_unexecuted_action_plan(_san_content)
+        ):
+            logger.warning(
+                "Local model produced an unexecuted action plan instead of a final answer; suppressing visible plan text"
+            )
+            _san_content = (
+                "Local model produced an unexecuted action plan instead of using tools. "
+                "No tool-backed action was run."
+            )
+
         msg = {
             "role": "assistant",
             "content": _san_content,
@@ -10127,6 +10204,89 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+
+    def _is_local_chat_completions_endpoint(self) -> bool:
+        """Return True for local OpenAI-compatible chat endpoints."""
+        if self.api_mode != "chat_completions":
+            return False
+        try:
+            if is_local_endpoint(self.base_url or ""):
+                return True
+        except Exception:
+            pass
+        provider = (self.provider or "").strip().lower()
+        return provider in {"local", "lmstudio", "ollama", "llamacpp", "mlx"}
+
+    def _recent_tool_call_signatures(self, messages: list) -> list[tuple[str, str]]:
+        """Return normalized signatures for the most recent assistant tool-call turn."""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                signatures = []
+                for tc in msg.get("tool_calls") or []:
+                    fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name") or ""
+                    raw_args = fn.get("arguments") or ""
+                    try:
+                        args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(",", ":"))
+                    except Exception:
+                        args = str(raw_args).strip()
+                    signatures.append((name, args))
+                return signatures
+        return []
+
+    def _tool_calls_repeat_recent_tool_calls(self, tool_calls, messages: list) -> bool:
+        """Detect a local model looping on the same tool call after tool results."""
+        if not any(isinstance(m, dict) and m.get("role") == "tool" for m in messages[-6:]):
+            return False
+        previous = self._recent_tool_call_signatures(messages)
+        if not previous:
+            return False
+        current = []
+        for tc in tool_calls or []:
+            name = getattr(getattr(tc, "function", None), "name", "") or ""
+            raw_args = getattr(getattr(tc, "function", None), "arguments", "") or ""
+            try:
+                args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(",", ":"))
+            except Exception:
+                args = str(raw_args).strip()
+            current.append((name, args))
+        return bool(current) and current == previous
+
+    def _try_toolless_final_pass_after_tools(self, api_messages: list, reason: str) -> Optional[str]:
+        """Ask a local OpenAI-compatible model to summarize tool results with tools disabled."""
+        if not self._is_local_chat_completions_endpoint():
+            return None
+
+        final_messages = [m.copy() if isinstance(m, dict) else m for m in api_messages]
+        final_messages.append({
+            "role": "user",
+            "content": (
+                "You just received the tool results above. Provide the final answer now, "
+                "using those results. Do not call tools. Do not mention this instruction. "
+                "Answer directly without calling any more tools."
+            ),
+        })
+        try:
+            final_kwargs = self._build_api_kwargs(final_messages)
+            final_kwargs.pop("tools", None)
+            final_kwargs.pop("tool_choice", None)
+            response = self._ensure_primary_openai_client(
+                reason=f"post_tool_final_pass_{reason}"
+            ).chat.completions.create(**final_kwargs)
+            result = self._get_transport().normalize_response(response)
+            content = self._strip_think_blocks(result.content or "").strip()
+            if content:
+                logger.info(
+                    "Recovered local empty/tool-loop response with toolless final pass (%s, %d chars)",
+                    reason, len(content),
+                )
+                self._emit_status("↻ Local model recovered after tool results — finalizing without tools")
+                return content
+        except Exception as exc:
+            logger.warning("Toolless final pass after tools failed (%s): %s", reason, exc)
+        return None
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
@@ -13121,6 +13281,16 @@ class AIAgent:
                         assistant_message.tool_calls
                     )
 
+                    if self._tool_calls_repeat_recent_tool_calls(assistant_message.tool_calls, messages):
+                        recovered = self._try_toolless_final_pass_after_tools(
+                            api_messages, "repeated_tool_call"
+                        )
+                        if recovered:
+                            _turn_exit_reason = "toolless_final_pass_after_repeated_tool_call"
+                            final_response = recovered
+                            messages.append({"role": "assistant", "content": final_response})
+                            break
+
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
                     # If this turn has both content AND tool_calls, capture the content
@@ -13336,6 +13506,25 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
+                        # ── Local OpenAI-compatible final pass after tools ─────────
+                        # Some local models (notably MLX/Gemma) execute tools correctly
+                        # then return an empty assistant turn when tools remain available.
+                        # One final pass with tools disabled lets the model summarize the
+                        # already-collected tool results instead of surfacing "(empty)".
+                        _prior_was_tool = any(
+                            m.get("role") == "tool"
+                            for m in messages[-5:]  # check recent messages
+                        )
+                        if _prior_was_tool:
+                            recovered = self._try_toolless_final_pass_after_tools(
+                                api_messages, "empty_after_tool"
+                            )
+                            if recovered:
+                                _turn_exit_reason = "toolless_final_pass_after_empty_tool_result"
+                                final_response = recovered
+                                messages.append({"role": "assistant", "content": final_response})
+                                break
+
                         # ── Post-tool-call empty response nudge ───────────
                         # The model returned empty after executing tool calls.
                         # This covers two cases:
@@ -13349,10 +13538,6 @@ class AIAgent:
                         # return empty after tool results instead of continuing
                         # to the next step.  One retry with a nudge usually
                         # fixes it.
-                        _prior_was_tool = any(
-                            m.get("role") == "tool"
-                            for m in messages[-5:]  # check recent messages
-                        )
                         if (
                             _prior_was_tool
                             and not getattr(self, "_post_tool_empty_retried", False)

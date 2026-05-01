@@ -108,8 +108,11 @@ def _strip_reasoning_tags(text: str) -> str:
       * Closed pairs ``<tag>…</tag>`` (case-insensitive, multi-line).
       * Unterminated open tags that run to end-of-text (e.g. truncated
         generations on NIM/MiniMax where the close tag is dropped).
-      * Stray orphan close tags (``stuff</think>answer``) left behind by
-        partial-content dumps.
+      * JANGTQ/Qwen pre-opened thinking output where generation starts inside
+        the reasoning block and only emits the closing tag
+        (``reasoning</think>answer``). Text before the first orphan close tag
+        is reasoning; text after it is the visible answer.
+      * Stray orphan close tags left behind by partial-content dumps.
 
     Covers the variants emitted by reasoning models today: ``<think>``,
     ``<thinking>``, ``<reasoning>``, ``<REASONING_SCRATCHPAD>``, and
@@ -136,6 +139,17 @@ def _strip_reasoning_tags(text: str) -> str:
             rf"<{tag}>.*$",
             "",
             cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # JANGTQ/Qwen reasoning-on completions can start *inside* the
+        # template's <think> block and therefore contain only the close
+        # marker followed by the final answer. Treat text before the first
+        # orphan close marker as reasoning and keep the answer after it.
+        cleaned = re.sub(
+            rf"^.*?</{tag}>\s*",
+            "",
+            cleaned,
+            count=1,
             flags=re.DOTALL | re.IGNORECASE,
         )
         # Stray orphan close tag left behind by partial dumps.
@@ -690,6 +704,11 @@ def _run_cleanup():
     try:
         from tools.mcp_tool import shutdown_mcp_servers
         shutdown_mcp_servers()
+    except Exception:
+        pass
+    try:
+        from hermes_cli.local_model_servers import stop_active_local_server
+        stop_active_local_server()
     except Exception:
         pass
     # Close cached auxiliary LLM clients (sync + async) so that
@@ -2087,6 +2106,17 @@ class HermesCLI:
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
         )
+        if self.model:
+            try:
+                from hermes_cli.models import parse_model_input
+
+                parsed_provider, parsed_model = parse_model_input(self.model, self.requested_provider)
+                self.requested_provider = parsed_provider
+                self.model = parsed_model
+            except Exception:
+                # Model parsing is convenience routing, not startup-critical.
+                # Runtime credential resolution will still surface invalid values.
+                pass
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
         self.api_mode = "chat_completions"
@@ -2104,6 +2134,7 @@ class HermesCLI:
             self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        self._start_configured_local_model_server(CLI_CONFIG)
         # Max turns priority: CLI arg > config file > env var > default
         if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
@@ -5428,11 +5459,52 @@ class HermesCLI:
         scroll_offset = max(0, min(scroll_offset, n - visible))
         return scroll_offset, visible
 
+    def _load_custom_providers_for_local_servers(self, config: dict | None = None) -> list:
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            return get_compatible_custom_providers(config or CLI_CONFIG)
+        except Exception:
+            raw = (config or CLI_CONFIG).get("custom_providers", []) if isinstance(config or CLI_CONFIG, dict) else []
+            return raw if isinstance(raw, list) else []
+
+    def _start_configured_local_model_server(self, config: dict | None = None) -> str:
+        try:
+            from hermes_cli.local_model_servers import find_server_action, start_server_action
+            custom_provs = self._load_custom_providers_for_local_servers(config)
+            action = find_server_action(self.requested_provider or "", self.model or "", custom_provs)
+            if action:
+                start_server_action(action)
+                return action
+        except Exception as exc:
+            logger.warning("Failed to start configured local model server: %s", exc)
+        return ""
+
+    def _cleanup_local_model_server(self) -> bool:
+        try:
+            from hermes_cli.local_model_servers import stop_active_local_server
+            return bool(stop_active_local_server())
+        except Exception as exc:
+            logger.warning("Failed to stop local model server: %s", exc)
+            return False
+
+    def _sync_local_model_server_after_switch(self, old_provider: str, old_model: str, result) -> None:
+        if getattr(result, "server_action", ""):
+            return
+        try:
+            from hermes_cli.local_model_servers import find_server_action, stop_active_local_server
+            custom_provs = self._load_custom_providers_for_local_servers(CLI_CONFIG)
+            old_action = find_server_action(old_provider or "", old_model or "", custom_provs)
+            if old_action:
+                stop_active_local_server()
+        except Exception as exc:
+            logger.warning("Failed to stop previous local model server: %s", exc)
+
     def _apply_model_switch_result(self, result, persist_global: bool) -> None:
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
 
+        old_provider = self.provider
         old_model = self.model
         self.model = result.new_model
         self.provider = result.target_provider
@@ -5457,6 +5529,8 @@ class HermesCLI:
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
+
+        self._sync_local_model_server_after_switch(old_provider or "", old_model or "", result)
 
         self._pending_model_switch_note = (
             f"[Note: model was just switched from {old_model} to {result.new_model} "
@@ -5656,6 +5730,7 @@ class HermesCLI:
         # Apply to CLI state.
         # Update requested_provider so _ensure_runtime_credentials() doesn't
         # overwrite the switch on the next turn (it re-resolves from this).
+        old_provider = self.provider
         old_model = self.model
         self.model = result.new_model
         self.provider = result.target_provider
@@ -5681,6 +5756,8 @@ class HermesCLI:
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
+
+        self._sync_local_model_server_after_switch(old_provider or "", old_model or "", result)
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history

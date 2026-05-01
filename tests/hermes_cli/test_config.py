@@ -488,6 +488,32 @@ class TestCustomProviderCompatibility:
         # custom_providers removed by migration — runtime reads via compat layer
         assert "custom_providers" not in raw
 
+    def test_preserves_server_action_for_local_model_providers(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        model_path = "/Users/jeroncrooks/.cache/lm-studio/models/mlx-community/gemma-4-26b-a4b-it-4bit"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 17,
+                    "custom_providers": [
+                        {
+                            "name": "local-mlx-gemma4-4bit",
+                            "base_url": "http://localhost:8092/v1",
+                            "model": model_path,
+                            "models": {model_path: {"context_length": 262144}},
+                            "server_action": "gemmamlx",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            compatible = get_compatible_custom_providers()
+
+        assert compatible[0]["server_action"] == "gemmamlx"
+
     def test_providers_dict_resolves_at_runtime(self, tmp_path):
         """After migration deleted custom_providers, get_compatible_custom_providers
         still finds entries from the providers dict."""

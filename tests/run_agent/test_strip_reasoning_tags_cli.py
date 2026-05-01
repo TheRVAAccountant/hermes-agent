@@ -48,6 +48,19 @@ class TestToolCallStripping:
         assert "reasoning" not in result
         assert "answer" in result
 
+    def test_jangtq_preopened_reasoning_stripped(self):
+        text = "Thinking Process:\n1. Analyze.\n</think>\n\nconfigured-bench-ok"
+        result = _strip_reasoning_tags(text)
+        assert "Thinking Process" not in result
+        assert result == "configured-bench-ok"
+
+    def test_visible_text_before_paired_think_is_preserved(self):
+        text = "visible <think>hidden</think> answer"
+        result = _strip_reasoning_tags(text)
+        assert "hidden" not in result
+        assert "visible" in result
+        assert "answer" in result
+
     def test_mixed_reasoning_and_tool_call(self):
         text = '<think>plan</think><tool_call>{"x":1}</tool_call>final'
         result = _strip_reasoning_tags(text)
