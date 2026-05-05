@@ -2140,6 +2140,31 @@ class TestProviderEntryApiKeyEnvAlias:
         key_env so the set stays in sync with what the runtime actually reads."""
         from hermes_cli.config import _VALID_CUSTOM_PROVIDER_FIELDS
         assert "key_env" in _VALID_CUSTOM_PROVIDER_FIELDS
+        assert "server_action" in _VALID_CUSTOM_PROVIDER_FIELDS
+
+    def test_server_action_is_preserved(self):
+        from hermes_cli.config import _normalize_custom_provider_entry
+        entry = {
+            "name": "local-mlx-qwen36-jangtq4",
+            "base_url": "http://localhost:8093/v1",
+            "model": "/models/qwen",
+            "server_action": "qwen36jangtq",
+        }
+        normalized = _normalize_custom_provider_entry(dict(entry))
+        assert normalized is not None
+        assert normalized.get("server_action") == "qwen36jangtq"
+
+    def test_camel_case_server_action_is_preserved(self):
+        from hermes_cli.config import _normalize_custom_provider_entry
+        entry = {
+            "name": "local-mlx-qwen36-jangtq4",
+            "base_url": "http://localhost:8093/v1",
+            "model": "/models/qwen",
+            "serverAction": "qwen36jangtq",
+        }
+        normalized = _normalize_custom_provider_entry(dict(entry))
+        assert normalized is not None
+        assert normalized.get("server_action") == "qwen36jangtq"
 # =============================================================================
 # Tencent TokenHub — API-key provider runtime resolution
 # =============================================================================

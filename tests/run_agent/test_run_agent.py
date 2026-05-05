@@ -297,25 +297,12 @@ class TestStripThinkBlocks:
     def test_orphaned_closing_think_tag(self, agent):
         result = agent._strip_think_blocks("some reasoning</think>actual answer")
         assert "</think>" not in result
-        assert "some reasoning" not in result
         assert "actual answer" in result
 
     def test_orphaned_closing_thinking_tag(self, agent):
         result = agent._strip_think_blocks("reasoning</thinking>answer")
         assert "</thinking>" not in result
-        assert "reasoning" not in result
         assert "answer" in result
-
-    def test_jangtq_preopened_think_block_removed(self, agent):
-        text = (
-            "Here's a thinking process:\n"
-            "1. Analyze the prompt.\n"
-            "</think>\n\n"
-            "configured-bench-ok"
-        )
-        result = agent._strip_think_blocks(text)
-        assert "thinking process" not in result
-        assert result.strip() == "configured-bench-ok"
 
     def test_orphaned_opening_think_tag(self, agent):
         result = agent._strip_think_blocks("<think>orphaned reasoning without close")
@@ -529,12 +516,6 @@ class TestExtractReasoning:
     def test_inline_reasoning_blocks_fallback(self, agent, content, expected):
         msg = _mock_assistant_msg(content=content)
         assert agent._extract_reasoning(msg) == expected
-
-    def test_jangtq_orphan_close_reasoning_fallback(self, agent):
-        msg = _mock_assistant_msg(
-            content="Thinking Process:\n1. Analyze.\n</think>\n\nconfigured-bench-ok"
-        )
-        assert agent._extract_reasoning(msg) == "Thinking Process:\n1. Analyze."
 
 
 class TestCleanSessionContent:
@@ -2200,6 +2181,83 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "reasoning" not in kwargs.get("extra_body", {})
 
+    def test_summary_request_removes_orphan_tool_result(self, agent):
+        """Regression: max-iterations summary request must NOT contain
+        orphan tool results (tool_call_id with no matching assistant tool_call)."""
+        resp = _mock_response(content="Summary of work done.")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "Analyze finance-data-router"},
+            {"role": "assistant", "content": "[Session Arc Summary] ..."},
+            {"role": "tool", "tool_call_id": "call_cfedFhJjGmu1RvRc1OUC38j8", "content": "file content here"},
+            {"role": "assistant", "tool_calls": [{"id": "call_8fXBXsT592Vpvm7wnW4obPEu", "function": {"name": "patch", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_8fXBXsT592Vpvm7wnW4obPEu", "content": "patch result"},
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = agent._handle_max_iterations(messages, 120)
+
+        assert result == "Summary of work done."
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        sent_msgs = kwargs.get("messages", [])
+        orphan_ids = [
+            m.get("tool_call_id") for m in sent_msgs
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_cfedFhJjGmu1RvRc1OUC38j8"
+        ]
+        assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
+
+    def test_summary_request_inserts_stub_for_missing_tool_result(self, agent):
+        """If an assistant tool_call has no matching tool result in the
+        summary request, a stub must be inserted to satisfy the API contract."""
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {"role": "assistant", "tool_calls": [{"id": "call_no_result", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "Continuing..."},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        sent_msgs = kwargs.get("messages", [])
+        stub_ids = [
+            m.get("tool_call_id") for m in sent_msgs
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_no_result"
+        ]
+        assert len(stub_ids) >= 1, f"No stub result for assistant tool_call: {stub_ids}"
+
+    def test_summary_omits_provider_preferences_for_non_openrouter(self, agent):
+        agent.base_url = "https://api.openai.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openai"
+        agent.providers_allowed = ["Anthropic"]
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert "provider" not in kwargs.get("extra_body", {})
+
+    def test_summary_keeps_provider_preferences_for_openrouter(self, agent):
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "openrouter"
+        agent.providers_allowed = ["Anthropic"]
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
+
     def test_codex_summary_sanitizes_orphan_tool_results(self, agent):
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
@@ -2313,30 +2371,6 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
-
-    def test_local_empty_after_tool_calls_gets_toolless_final_pass(self, agent):
-        self._setup_agent(agent)
-        agent.base_url = "http://127.0.0.1:8092/v1"
-        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
-        resp2 = _mock_response(content="", finish_reason="stop")
-        resp3 = _mock_response(content="Summarized search result", finish_reason="stop")
-        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
-
-        with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("search something")
-
-        assert result["final_response"] == "Summarized search result"
-        assert len(agent.client.chat.completions.create.call_args_list) == 3
-        final_kwargs = agent.client.chat.completions.create.call_args_list[-1].kwargs
-        assert "tools" not in final_kwargs
-        assert final_kwargs["messages"][-1]["role"] == "user"
-        assert "without calling any more tools" in final_kwargs["messages"][-1]["content"]
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

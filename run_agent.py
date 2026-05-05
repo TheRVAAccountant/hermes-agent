@@ -304,7 +304,8 @@ class IterationBudget:
 
     @property
     def used(self) -> int:
-        return self._used
+        with self._lock:
+            return self._used
 
     @property
     def remaining(self) -> int:
@@ -1258,6 +1259,10 @@ class AIAgent:
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
 
+        # OpenRouter response cache hit counter — incremented when
+        # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
+        self._or_cache_hits: int = 0
+
         # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
         # (which creates a new AIAgent per message) won't duplicate handlers.
@@ -1421,11 +1426,8 @@ class AIAgent:
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
                 if base_url_host_matches(effective_base, "openrouter.ai"):
-                    client_kwargs["default_headers"] = {
-                        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-                        "X-OpenRouter-Title": "Hermes Agent",
-                        "X-OpenRouter-Categories": "productivity,cli-agent",
-                    }
+                    from agent.auxiliary_client import build_or_headers
+                    client_kwargs["default_headers"] = build_or_headers()
                 elif base_url_host_matches(effective_base, "api.routermint.com"):
                     client_kwargs["default_headers"] = _routermint_headers()
                 elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
@@ -1473,17 +1475,49 @@ class AIAgent:
                                 _env_hint = _pcfg.api_key_env_vars[0]
                         except Exception:
                             pass
+                        # --- Init-time fallback (#17929) ---
+                        _fb_entries = []
+                        if isinstance(fallback_model, list):
+                            _fb_entries = [
+                                f for f in fallback_model
+                                if isinstance(f, dict) and f.get("provider") and f.get("model")
+                            ]
+                        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+                            _fb_entries = [fallback_model]
+                        _fb_resolved = False
+                        for _fb in _fb_entries:
+                            _fb_client, _fb_model = resolve_provider_client(
+                                _fb["provider"], model=_fb["model"], raw_codex=True,
+                                explicit_base_url=_fb.get("base_url"),
+                                explicit_api_key=_fb.get("api_key"),
+                            )
+                            if _fb_client is not None:
+                                self.provider = _fb["provider"]
+                                self.model = _fb_model or _fb["model"]
+                                self._fallback_activated = True
+                                client_kwargs = {
+                                    "api_key": _fb_client.api_key,
+                                    "base_url": str(_fb_client.base_url),
+                                }
+                                if _provider_timeout is not None:
+                                    client_kwargs["timeout"] = _provider_timeout
+                                if hasattr(_fb_client, "_default_headers") and _fb_client._default_headers:
+                                    client_kwargs["default_headers"] = dict(_fb_client._default_headers)
+                                _fb_resolved = True
+                                break
+                        if not _fb_resolved:
+                            raise RuntimeError(
+                                f"Provider '{_explicit}' is set in config.yaml but no API key "
+                                f"was found. Set the {_env_hint} environment "
+                                f"variable, or switch to a different provider with `hermes model`."
+                            )
+                    if not getattr(self, "_fallback_activated", False):
+                        # No provider configured — reject with a clear message.
                         raise RuntimeError(
-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
-                            f"was found. Set the {_env_hint} environment "
-                            f"variable, or switch to a different provider with `hermes model`."
+                            "No LLM provider configured. Run `hermes model` to "
+                            "select a provider, or run `hermes setup` for first-time "
+                            "configuration."
                         )
-                    # No provider configured — reject with a clear message.
-                    raise RuntimeError(
-                        "No LLM provider configured. Run `hermes model` to "
-                        "select a provider, or run `hermes setup` for first-time "
-                        "configuration."
-                    )
             
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1536,7 +1570,7 @@ class AIAgent:
         else:
             self._fallback_chain = []
         self._fallback_index = 0
-        self._fallback_activated = False
+        self._fallback_activated = getattr(self, "_fallback_activated", False)
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -1632,30 +1666,12 @@ class AIAgent:
         self._session_db = session_db
         self._parent_session_id = parent_session_id
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
-        if self._session_db:
-            try:
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                    model=self.model,
-                    model_config={
-                        "max_iterations": self.max_iterations,
-                        "reasoning_config": reasoning_config,
-                        "max_tokens": max_tokens,
-                    },
-                    user_id=None,
-                    parent_session_id=self._parent_session_id,
-                )
-            except Exception as e:
-                # Transient SQLite lock contention (e.g. CLI and gateway writing
-                # concurrently) must NOT permanently disable session_search for
-                # this agent.  Keep _session_db alive — subsequent message
-                # flushes and session_search calls will still work once the
-                # lock clears.  The session row may be missing from the index
-                # for this run, but that is recoverable (flushes upsert rows).
-                logger.warning(
-                    "Session DB create_session failed (session_search still available): %s", e
-                )
+        self._session_db_created = False  # DB row deferred to run_conversation()
+        self._session_init_model_config = {
+            "max_iterations": self.max_iterations,
+            "reasoning_config": reasoning_config,
+            "max_tokens": max_tokens,
+        }
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -2169,6 +2185,28 @@ class AIAgent:
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
+
+    def _ensure_db_session(self) -> None:
+        """Create session DB row on first use. Disables _session_db on failure."""
+        if self._session_db_created or not self._session_db:
+            return
+        try:
+            self._session_db.create_session(
+                session_id=self.session_id,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=self.model,
+                model_config=self._session_init_model_config,
+                system_prompt=self._cached_system_prompt,
+                user_id=None,
+                parent_session_id=self._parent_session_id,
+            )
+            self._session_db_created = True
+        except Exception as e:
+            # Transient failure (e.g. SQLite lock). Keep _session_db alive —
+            # _session_db_created stays False so next run_conversation() retries.
+            logger.warning(
+                "Session DB creation failed (will retry next turn): %s", e
+            )
 
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -2996,7 +3034,7 @@ class AIAgent:
     def _strip_think_blocks(self, content: str) -> str:
         """Remove reasoning/thinking blocks from content, returning only visible text.
 
-        Handles five cases:
+        Handles four cases:
           1. Closed tag pairs (``<think>…</think>``) — the common path when
              the provider emits complete reasoning blocks.
           2. Unterminated open tag at a block boundary (start of text or
@@ -3005,14 +3043,8 @@ class AIAgent:
              of string is stripped.  The block-boundary check mirrors
              ``gateway/stream_consumer.py``'s filter so models that mention
              ``<think>`` in prose aren't over-stripped.
-          3. JANGTQ/Qwen pre-opened thinking output where generation starts
-             inside the reasoning block and only emits the closing tag
-             (``reasoning</think>answer``).  The model card documents that
-             ``enable_thinking=True`` makes the model fill a ``<think>`` block;
-             with generation APIs that begin after the opening tag, the visible
-             completion contains the reasoning prefix plus orphan close tag.
-          4. Stray orphan open/close tags that slip through.
-          5. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
+          3. Stray orphan open/close tags that slip through.
+          4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
              ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
              case-insensitive.
 
@@ -3074,17 +3106,6 @@ class AIAgent:
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        # 2b. JANGTQ/Qwen reasoning-on completions can start *inside* the
-        #     template's <think> block and therefore contain only the close
-        #     marker followed by the final answer. Treat text before the first
-        #     orphan close marker as reasoning and keep the answer after it.
-        content = re.sub(
-            r'^.*?</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
-            '',
-            content,
-            count=1,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
         # 3. Stray orphan open/close tags that slipped through.
         content = re.sub(
             r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
@@ -3115,41 +3136,6 @@ class AIAgent:
         if stripped.endswith("```"):
             return True
         return stripped[-1] in '.!?:)"\']}。！？：）】」』》'
-
-    @staticmethod
-    def _looks_like_unexecuted_action_plan(content: str) -> bool:
-        """Detect local-model turns that promise tool work instead of doing it."""
-        text = (content or "").strip()
-        if not text:
-            return False
-        lower = text.lower()
-        if lower.startswith("here's a thinking process") or lower.startswith("here is a thinking process"):
-            return True
-        if "understand user request" in lower and "formulate response strategy" in lower:
-            return True
-        markers = (
-            "the user wants",
-            "i need to",
-            "i should",
-            "i will",
-            "i'll",
-            "let me",
-            "i can",
-        )
-        marker_count = sum(lower.count(marker) for marker in markers)
-        if marker_count < 4:
-            return False
-        result_markers = (
-            "here are",
-            "clients:",
-            "completed",
-            "done",
-            "result:",
-            "i found",
-        )
-        if any(marker in lower for marker in result_markers):
-            return False
-        return True
 
     def _is_ollama_glm_backend(self) -> bool:
         """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
@@ -3323,16 +3309,6 @@ class AIAgent:
                 for block in re.findall(pattern, content, flags=flags):
                     cleaned = block.strip()
                     if cleaned and cleaned not in reasoning_parts:
-                        reasoning_parts.append(cleaned)
-            if not reasoning_parts:
-                orphan_close = re.search(
-                    r"^(.*?)</(?:think|thinking|thought|reasoning|REASONING_SCRATCHPAD)>",
-                    content,
-                    flags=re.DOTALL | re.IGNORECASE,
-                )
-                if orphan_close:
-                    cleaned = orphan_close.group(1).strip()
-                    if cleaned:
                         reasoning_parts.append(cleaned)
         
         # Combine all reasoning parts
@@ -3636,7 +3612,7 @@ class AIAgent:
                     _parent_runtime = self._current_main_runtime()
                     review_agent = AIAgent(
                         model=self.model,
-                        max_iterations=8,
+                        max_iterations=16,
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
@@ -3654,6 +3630,14 @@ class AIAgent:
                     review_agent._user_profile_enabled = self._user_profile_enabled
                     review_agent._memory_nudge_interval = 0
                     review_agent._skill_nudge_interval = 0
+                    # Suppress all status/warning emits from the fork so the
+                    # user only sees the final successful-action summary.
+                    # Without this, mid-review "Iteration budget exhausted",
+                    # rate-limit retries, compression warnings, and other
+                    # lifecycle messages bubble up through _emit_status ->
+                    # _vprint and leak past the stdout redirect (they go via
+                    # _print_fn/status_callback, which bypass sys.stdout).
+                    review_agent.suppress_status_output = True
 
                     review_agent.run_conversation(
                         user_message=prompt,
@@ -3781,14 +3765,9 @@ class AIAgent:
             return
         self._apply_persist_user_message_override(messages)
         try:
-            # If create_session() failed at startup (e.g. transient lock), the
-            # session row may not exist yet.  ensure_session() uses INSERT OR
-            # IGNORE so it is a no-op when the row is already there.
-            self._session_db.ensure_session(
-                self.session_id,
-                source=self.platform or "cli",
-                model=self.model,
-            )
+            # Retry row creation if the earlier attempt failed transiently.
+            if not self._session_db_created:
+                self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
@@ -4611,6 +4590,28 @@ class AIAgent:
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
 
+    def _check_openrouter_cache_status(self, http_response: Any) -> None:
+        """Read X-OpenRouter-Cache-Status from response headers and log it.
+
+        Increments ``_or_cache_hits`` on HIT so callers can report savings.
+        """
+        if http_response is None:
+            return
+        headers = getattr(http_response, "headers", None)
+        if not headers:
+            return
+        try:
+            status = headers.get("x-openrouter-cache-status")
+            if not status:
+                return
+            if status.upper() == "HIT":
+                self._or_cache_hits += 1
+                logger.info("OpenRouter response cache HIT (total: %d)", self._or_cache_hits)
+            else:
+                logger.debug("OpenRouter response cache %s", status.upper())
+        except Exception:
+            pass  # Never let header parsing break the agent loop
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
@@ -5064,6 +5065,23 @@ class AIAgent:
             return tc.get("call_id", "") or tc.get("id", "") or ""
         return getattr(tc, "call_id", "") or getattr(tc, "id", "") or ""
 
+    @staticmethod
+    def _get_tool_call_name_static(tc) -> str:
+        """Extract function name from a tool_call entry (dict or object).
+
+        Gemini's OpenAI-compatibility endpoint requires every `role: tool`
+        message to carry the matching function name. OpenAI/Anthropic/ollama
+        tolerate its absence, so the field is best-effort: callers fall back
+        to "" and the message still works elsewhere.
+        """
+        if isinstance(tc, dict):
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                return fn.get("name", "") or ""
+            return ""
+        fn = getattr(tc, "function", None)
+        return getattr(fn, "name", "") or ""
+
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
 
     @staticmethod
@@ -5126,6 +5144,7 @@ class AIAgent:
                         if cid in missing_results:
                             patched.append({
                                 "role": "tool",
+                                "name": AIAgent._get_tool_call_name_static(tc),
                                 "content": "[Result unavailable — see context summary above]",
                                 "tool_call_id": cid,
                             })
@@ -5824,6 +5843,17 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
+        # Per-request OpenAI-wire clients (used by both the non-streaming
+        # chat-completions path and the streaming chat-completions path
+        # in `_interruptible_api_call`) should not run the SDK's built-in
+        # retry loop: the agent's outer loop owns retries with credential
+        # rotation, provider fallback, and backoff that the SDK can't
+        # see. Leaving SDK retries on (default 2) compounds with our outer
+        # retries and lets a single hung provider request stretch to ~3x
+        # the per-call timeout before our stale detector reports it.
+        # Shared/primary clients and Anthropic / Bedrock paths are
+        # unaffected (they don't go through here).
+        request_kwargs["max_retries"] = 0
         if (
             base_url_host_matches(str(request_kwargs.get("base_url", "")), "api.githubcopilot.com")
             and self._api_kwargs_have_image_parts(api_kwargs or {})
@@ -6188,10 +6218,10 @@ class AIAgent:
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
-        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, _OR_HEADERS
+        from agent.auxiliary_client import _AI_GATEWAY_HEADERS, build_or_headers
 
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = dict(_OR_HEADERS)
+            self._client_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
             self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "api.routermint.com"):
@@ -6810,6 +6840,9 @@ class AIAgent:
             # The OpenAI SDK Stream object exposes the underlying httpx
             # response via .response before any chunks are consumed.
             self._capture_rate_limits(getattr(stream, "response", None))
+
+            # Log OpenRouter response cache status when present.
+            self._check_openrouter_cache_status(getattr(stream, "response", None))
 
             content_parts: list = []
             tool_calls_acc: dict = {}
@@ -8197,6 +8230,7 @@ class AIAgent:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
         MiniMax keeps dots (e.g. MiniMax-M2.7).
+        Xiaomi MiMo keeps dots (e.g. mimo-v2.5, mimo-v2.5-pro).
         OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
         ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1).
         AWS Bedrock uses dotted inference-profile IDs
@@ -8210,6 +8244,7 @@ class AIAgent:
             "alibaba", "minimax", "minimax-cn",
             "opencode-go", "opencode-zen",
             "zai", "bedrock",
+            "xiaomi",
         }:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
@@ -8219,6 +8254,7 @@ class AIAgent:
             or "minimax" in base
             or "opencode.ai/zen/" in base
             or "bigmodel.cn" in base
+            or "xiaomimimo.com" in base
             # AWS Bedrock runtime endpoints — defense-in-depth when
             # ``provider`` is unset but ``base_url`` still names Bedrock.
             or "bedrock-runtime." in base
@@ -8645,21 +8681,6 @@ class AIAgent:
         if isinstance(_san_content, str) and _san_content:
             _san_content = self._strip_think_blocks(_san_content).strip()
 
-        if (
-            isinstance(_san_content, str)
-            and _san_content
-            and self._is_local_chat_completions_endpoint()
-            and not getattr(assistant_message, "tool_calls", None)
-            and self._looks_like_unexecuted_action_plan(_san_content)
-        ):
-            logger.warning(
-                "Local model produced an unexecuted action plan instead of a final answer; suppressing visible plan text"
-            )
-            _san_content = (
-                "Local model produced an unexecuted action plan instead of using tools. "
-                "No tool-backed action was run."
-            )
-
         msg = {
             "role": "assistant",
             "content": _san_content,
@@ -9028,6 +9049,7 @@ class AIAgent:
                             insert_at,
                             {
                                 "role": "tool",
+                                "name": function_name if function_name != "?" else "",
                                 "tool_call_id": tool_call_id,
                                 "content": marker,
                             },
@@ -9133,12 +9155,15 @@ class AIAgent:
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                self._session_db_created = False
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    model_config=self._session_init_model_config,
                     parent_session_id=old_session_id,
                 )
+                self._session_db_created = True
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -9429,6 +9454,7 @@ class AIAgent:
             for tc in tool_calls:
                 messages.append({
                     "role": "tool",
+                    "name": tc.function.name,
                     "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
                     "tool_call_id": tc.id,
                 })
@@ -9770,6 +9796,7 @@ class AIAgent:
 
             tool_msg = {
                 "role": "tool",
+                "name": name,
                 "content": function_result,
                 "tool_call_id": tc.id,
             }
@@ -9807,6 +9834,7 @@ class AIAgent:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
+                        "name": skipped_name,
                         "content": f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
                         "tool_call_id": skipped_tc.id,
                     }
@@ -10157,6 +10185,7 @@ class AIAgent:
 
             tool_msg = {
                 "role": "tool",
+                "name": function_name,
                 "content": function_result,
                 "tool_call_id": tool_call.id
             }
@@ -10183,6 +10212,7 @@ class AIAgent:
                     skipped_name = skipped_tc.function.name
                     skip_msg = {
                         "role": "tool",
+                        "name": skipped_name,
                         "content": f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
                         "tool_call_id": skipped_tc.id
                     }
@@ -10204,89 +10234,6 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
-
-    def _is_local_chat_completions_endpoint(self) -> bool:
-        """Return True for local OpenAI-compatible chat endpoints."""
-        if self.api_mode != "chat_completions":
-            return False
-        try:
-            if is_local_endpoint(self.base_url or ""):
-                return True
-        except Exception:
-            pass
-        provider = (self.provider or "").strip().lower()
-        return provider in {"local", "lmstudio", "ollama", "llamacpp", "mlx"}
-
-    def _recent_tool_call_signatures(self, messages: list) -> list[tuple[str, str]]:
-        """Return normalized signatures for the most recent assistant tool-call turn."""
-        for msg in reversed(messages):
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                signatures = []
-                for tc in msg.get("tool_calls") or []:
-                    fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
-                    name = fn.get("name") or ""
-                    raw_args = fn.get("arguments") or ""
-                    try:
-                        args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(",", ":"))
-                    except Exception:
-                        args = str(raw_args).strip()
-                    signatures.append((name, args))
-                return signatures
-        return []
-
-    def _tool_calls_repeat_recent_tool_calls(self, tool_calls, messages: list) -> bool:
-        """Detect a local model looping on the same tool call after tool results."""
-        if not any(isinstance(m, dict) and m.get("role") == "tool" for m in messages[-6:]):
-            return False
-        previous = self._recent_tool_call_signatures(messages)
-        if not previous:
-            return False
-        current = []
-        for tc in tool_calls or []:
-            name = getattr(getattr(tc, "function", None), "name", "") or ""
-            raw_args = getattr(getattr(tc, "function", None), "arguments", "") or ""
-            try:
-                args = json.dumps(json.loads(raw_args), sort_keys=True, separators=(",", ":"))
-            except Exception:
-                args = str(raw_args).strip()
-            current.append((name, args))
-        return bool(current) and current == previous
-
-    def _try_toolless_final_pass_after_tools(self, api_messages: list, reason: str) -> Optional[str]:
-        """Ask a local OpenAI-compatible model to summarize tool results with tools disabled."""
-        if not self._is_local_chat_completions_endpoint():
-            return None
-
-        final_messages = [m.copy() if isinstance(m, dict) else m for m in api_messages]
-        final_messages.append({
-            "role": "user",
-            "content": (
-                "You just received the tool results above. Provide the final answer now, "
-                "using those results. Do not call tools. Do not mention this instruction. "
-                "Answer directly without calling any more tools."
-            ),
-        })
-        try:
-            final_kwargs = self._build_api_kwargs(final_messages)
-            final_kwargs.pop("tools", None)
-            final_kwargs.pop("tool_choice", None)
-            response = self._ensure_primary_openai_client(
-                reason=f"post_tool_final_pass_{reason}"
-            ).chat.completions.create(**final_kwargs)
-            result = self._get_transport().normalize_response(response)
-            content = self._strip_think_blocks(result.content or "").strip()
-            if content:
-                logger.info(
-                    "Recovered local empty/tool-loop response with toolless final pass (%s, %d chars)",
-                    reason, len(content),
-                )
-                self._emit_status("↻ Local model recovered after tool results — finalizing without tools")
-                return content
-        except Exception as exc:
-            logger.warning("Toolless final pass after tools failed (%s): %s", reason, exc)
-        return None
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
@@ -10400,7 +10347,10 @@ class AIAgent:
                     provider_preferences["order"] = self.providers_order
                 if self.provider_sort:
                     provider_preferences["sort"] = self.provider_sort
-                if provider_preferences:
+                if provider_preferences and (
+                    (self.provider or "").strip().lower() == "openrouter"
+                    or self._is_openrouter_url()
+                ):
                     summary_extra_body["provider"] = provider_preferences
 
                 if summary_extra_body:
@@ -10511,10 +10461,21 @@ class AIAgent:
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
 
+        self._ensure_db_session()
+
         # Tag all log records on this thread with the session ID so
         # ``hermes logs --session <id>`` can filter a single conversation.
         from hermes_logging import set_session_context
         set_session_context(self.session_id)
+
+        # Bind the skill write-origin ContextVar for this thread so tool
+        # handlers (e.g. skill_manage create) can tell whether they are
+        # running inside the background self-improvement review fork vs.
+        # a foreground user-directed turn. Set at the top of each call;
+        # the review fork runs on its own thread with a fresh context,
+        # so the foreground value here does not leak into it.
+        from tools.skill_provenance import set_current_write_origin
+        set_current_write_origin(getattr(self, "_memory_write_origin", "assistant_tool"))
 
         # If the previous turn activated fallback, restore the primary
         # runtime so this turn gets a fresh attempt with the preferred model.
@@ -10721,11 +10682,11 @@ class AIAgent:
                     self.model,
                     f"{self.context_compressor.context_length:,}",
                 )
-                if not self.quiet_mode:
-                    self._safe_print(
-                        f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                        f">= {self.context_compressor.threshold_tokens:,} threshold"
-                    )
+                self._emit_status(
+                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                    f">= {self.context_compressor.threshold_tokens:,} threshold. "
+                    "This may take a moment."
+                )
                 # May need multiple passes for very large sessions with small
                 # context windows (each pass summarises the middle N turns).
                 for _pass in range(3):
@@ -13174,6 +13135,7 @@ class AIAgent:
                                 content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
                             messages.append({
                                 "role": "tool",
+                                "name": tc.function.name,
                                 "tool_call_id": tc.id,
                                 "content": content,
                             })
@@ -13265,6 +13227,7 @@ class AIAgent:
                                     tool_result = "Skipped: other tool call in this response had invalid JSON."
                                 messages.append({
                                     "role": "tool",
+                                    "name": tc.function.name,
                                     "tool_call_id": tc.id,
                                     "content": tool_result,
                                 })
@@ -13280,16 +13243,6 @@ class AIAgent:
                     assistant_message.tool_calls = self._deduplicate_tool_calls(
                         assistant_message.tool_calls
                     )
-
-                    if self._tool_calls_repeat_recent_tool_calls(assistant_message.tool_calls, messages):
-                        recovered = self._try_toolless_final_pass_after_tools(
-                            api_messages, "repeated_tool_call"
-                        )
-                        if recovered:
-                            _turn_exit_reason = "toolless_final_pass_after_repeated_tool_call"
-                            final_response = recovered
-                            messages.append({"role": "assistant", "content": final_response})
-                            break
 
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
@@ -13506,25 +13459,6 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
-                        # ── Local OpenAI-compatible final pass after tools ─────────
-                        # Some local models (notably MLX/Gemma) execute tools correctly
-                        # then return an empty assistant turn when tools remain available.
-                        # One final pass with tools disabled lets the model summarize the
-                        # already-collected tool results instead of surfacing "(empty)".
-                        _prior_was_tool = any(
-                            m.get("role") == "tool"
-                            for m in messages[-5:]  # check recent messages
-                        )
-                        if _prior_was_tool:
-                            recovered = self._try_toolless_final_pass_after_tools(
-                                api_messages, "empty_after_tool"
-                            )
-                            if recovered:
-                                _turn_exit_reason = "toolless_final_pass_after_empty_tool_result"
-                                final_response = recovered
-                                messages.append({"role": "assistant", "content": final_response})
-                                break
-
                         # ── Post-tool-call empty response nudge ───────────
                         # The model returned empty after executing tool calls.
                         # This covers two cases:
@@ -13538,9 +13472,26 @@ class AIAgent:
                         # return empty after tool results instead of continuing
                         # to the next step.  One retry with a nudge usually
                         # fixes it.
+                        _prior_was_tool = any(
+                            m.get("role") == "tool"
+                            for m in messages[-5:]  # check recent messages
+                        )
+                        # Detect Qwen3/Ollama-style in-content thinking blocks.
+                        # Ollama puts <think> in the content field (not in
+                        # reasoning_content), so _has_structured below would
+                        # miss it.  We check here so thinking-only responses
+                        # after tool calls route to prefill instead of nudge.
+                        _has_inline_thinking = bool(
+                            re.search(
+                                r'<think>|<thinking>|<reasoning>',
+                                final_response or "",
+                                re.IGNORECASE,
+                            )
+                        )
                         if (
                             _prior_was_tool
                             and not getattr(self, "_post_tool_empty_retried", False)
+                            and not _has_inline_thinking  # thinking model still working — let prefill handle
                         ):
                             self._post_tool_empty_retried = True
                             # Clear stale narration so it doesn't resurface
@@ -13580,10 +13531,13 @@ class AIAgent:
                         # continue — the model will see its own reasoning
                         # on the next turn and produce the text portion.
                         # Inspired by clawdbot's "incomplete-text" recovery.
+                        # Also covers Qwen3/Ollama in-content <think> blocks
+                        # (detected above as _has_inline_thinking).
                         _has_structured = bool(
                             getattr(assistant_message, "reasoning", None)
                             or getattr(assistant_message, "reasoning_content", None)
                             or getattr(assistant_message, "reasoning_details", None)
+                            or _has_inline_thinking
                         )
                         if _has_structured and self._thinking_prefill_retries < 2:
                             self._thinking_prefill_retries += 1
@@ -13790,6 +13744,7 @@ class AIAgent:
                             if tc["id"] not in answered_ids:
                                 err_msg = {
                                     "role": "tool",
+                                    "name": AIAgent._get_tool_call_name_static(tc),
                                     "tool_call_id": tc["id"],
                                     "content": f"Error executing tool: {error_msg}",
                                 }

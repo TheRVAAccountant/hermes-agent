@@ -18,53 +18,6 @@ _MOCK_VALIDATION = {
 }
 
 
-def test_switch_model_starts_configured_local_server_before_validation(monkeypatch):
-    """Local provider switches should start the backing server before /v1/models validation."""
-    events = []
-    model_path = "/Users/jeroncrooks/.cache/lm-studio/models/mlx-community/gemma-4-26b-a4b-it-4bit"
-
-    monkeypatch.setattr(
-        "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda **kwargs: events.append("resolve") or {
-            "api_key": "***",
-            "base_url": "http://localhost:8092/v1",
-            "api_mode": "chat_completions",
-        },
-    )
-
-    def _validate(*args, **kwargs):
-        events.append("validate")
-        return _MOCK_VALIDATION
-
-    monkeypatch.setattr("hermes_cli.local_model_servers.start_server_action", lambda action: events.append(f"start:{action}"))
-    monkeypatch.setattr("hermes_cli.models.validate_requested_model", _validate)
-    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
-    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
-
-    result = switch_model(
-        raw_input=model_path,
-        current_provider="openai-codex",
-        current_model="gpt-5.4",
-        current_base_url="https://chatgpt.com/backend-api/codex",
-        current_api_key="",
-        explicit_provider="custom:local-mlx-gemma4-4bit",
-        user_providers={},
-        custom_providers=[
-            {
-                "name": "local-mlx-gemma4-4bit",
-                "base_url": "http://localhost:8092/v1",
-                "model": model_path,
-                "models": {model_path: {"context_length": 262144}},
-                "server_action": "gemmamlx",
-            }
-        ],
-    )
-
-    assert result.success is True
-    assert result.server_action == "gemmamlx"
-    assert events.index("start:gemmamlx") < events.index("validate")
-
-
 def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     """No-args /model menus should include saved custom_providers entries."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})

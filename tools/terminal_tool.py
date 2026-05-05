@@ -1565,42 +1565,6 @@ def _looks_like_help_or_version_command(command: str) -> bool:
     )
 
 
-def _recursive_hermes_cli_guidance(command: str) -> str | None:
-    """Block accidental nested Hermes agent runs from the terminal tool.
-
-    Local models are commonly single-server resources. If an active Hermes agent
-    asks the terminal tool to run `hermes chat`, it creates a recursive agent
-    call that competes with the parent model endpoint and often fails with a
-    confusing connection error. Status/config commands are fine; only agent-run
-    entrypoints are rejected.
-    """
-    normalized = " ".join(command.split())
-    if _looks_like_help_or_version_command(normalized):
-        return None
-
-    # Match command-position invocations like:
-    #   hermes chat -q ...
-    #   .venv/bin/hermes chat -q ...
-    #   HERMES_ACCEPT_HOOKS=1 .venv/bin/hermes chat -q ...
-    #   uv run hermes chat -q ...
-    hermes_chat_re = re.compile(
-        r"(?:^|[;&|])\s*"
-        r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
-        r"(?:(?:uv|python(?:3(?:\.\d+)?)?)\s+(?:run\s+)?)?"
-        r"(?:\S*/)?hermes\s+(?:chat\b|--tui\b|$)",
-        re.IGNORECASE,
-    )
-    if not hermes_chat_re.search(normalized):
-        return None
-
-    return (
-        "Do not invoke `hermes chat` from inside a running Hermes agent. "
-        "Use the current agent's tools directly; if you truly need another "
-        "agent, use delegate_task or an explicit background process requested "
-        "by the user."
-    )
-
-
 def _foreground_background_guidance(command: str) -> str | None:
     """Suggest background mode when a foreground command looks long-lived.
 
@@ -1609,10 +1573,6 @@ def _foreground_background_guidance(command: str) -> str | None:
     """
     if _looks_like_help_or_version_command(command):
         return None
-
-    recursive_guidance = _recursive_hermes_cli_guidance(command)
-    if recursive_guidance:
-        return recursive_guidance
 
     if _SHELL_LEVEL_BACKGROUND_RE.search(command):
         return (

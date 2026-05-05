@@ -210,6 +210,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 client_secret=self._client_secret,
                 tenant_id=self._tenant_id,
                 http_server_adapter=_AiohttpBridgeAdapter(aiohttp_app),
+                client=ClientOptions(headers={"User-Agent": "Hermes"}),
             )
 
             # Register message handler before initialize()
@@ -591,6 +592,8 @@ def interactive_setup() -> None:
     from hermes_cli.config import (
         get_env_value,
         save_env_value,
+    )
+    from hermes_cli.cli_output import (
         prompt,
         prompt_yes_no,
         print_info,
