@@ -28,7 +28,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # (useful for worktrees where we don't always duplicate the venv).
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ ! -f "$candidate/bin/activate" ]; then
+    continue
+  fi
+  candidate_python="$candidate/bin/python"
+  if "$candidate_python" -c "import pytest_split" 2>/dev/null \
+     || "$candidate_python" -m pip --version >/dev/null 2>&1; then
     VENV="$candidate"
     break
   fi
