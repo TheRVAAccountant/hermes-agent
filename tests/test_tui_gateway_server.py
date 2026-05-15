@@ -2313,6 +2313,45 @@ def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
     assert "failed" in resp["error"]["message"]
 
 
+def test_codex_compact_dispatch_targets_live_agent(monkeypatch):
+    class _Agent:
+        def __init__(self):
+            self.calls = 0
+
+        def compact_codex_app_server(self):
+            self.calls += 1
+            return True, "Codex app-server compaction requested."
+
+    agent = _Agent()
+    server._sessions["sid"] = _session(agent)
+    try:
+        worker_resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"command": "codex-compact", "session_id": "sid"},
+            }
+        )
+        with patch("tui_gateway.server._emit"):
+            dispatch_resp = server.handle_request(
+                {
+                    "id": "2",
+                    "method": "command.dispatch",
+                    "params": {"name": "ccompact", "arg": "", "session_id": "sid"},
+                }
+            )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert worker_resp["error"]["code"] == 4018
+    assert "pending-input command" in worker_resp["error"]["message"]
+    assert dispatch_resp["result"] == {
+        "type": "exec",
+        "output": "Codex app-server compaction requested.",
+    }
+    assert agent.calls == 1
+
+
 def test_plugins_list_surfaces_loader_error(monkeypatch):
     with patch("hermes_cli.plugins.get_plugin_manager", side_effect=Exception("boom")):
         resp = server.handle_request(
