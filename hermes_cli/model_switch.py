@@ -908,26 +908,6 @@ def switch_model(
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
-    # --- Start configured local server before endpoint validation ---
-    if custom_providers and target_provider.startswith("custom:"):
-        try:
-            from hermes_cli.local_model_servers import find_server_action, start_server_action
-
-            server_action = find_server_action(target_provider, new_model, custom_providers)
-            if server_action:
-                start_server_action(server_action)
-        except Exception as e:
-            return ModelSwitchResult(
-                success=False,
-                new_model=new_model,
-                target_provider=target_provider,
-                provider_label=provider_label,
-                is_global=is_global,
-                error_message=(
-                    f"Could not start local model server for '{provider_label}': {e}"
-                ),
-            )
-
     # --- Validate ---
     try:
         validation = validate_requested_model(

@@ -159,16 +159,6 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
-    def test_compact_thread_calls_codex_app_server_method(self):
-        client = FakeClient()
-        s = make_session(client)
-        result = s.compact_thread(timeout=3.0)
-        assert result == {}
-        assert (
-            "thread/compact/start",
-            {"threadId": "thread-fake-001"},
-        ) in client.requests
-
 
 # ---- turn loop ----
 
@@ -241,6 +231,86 @@ class TestRunTurn:
         assert "bad input" in r.error
         assert r.final_text == ""
 
+    def test_turn_start_failure_attaches_redacted_stderr_tail(self):
+        """When codex stderr has content (non-OAuth), the tail gets attached
+        to the user-facing error so config/provider problems are debuggable
+        instead of just 'Internal error'. Secrets in stderr are redacted
+        via agent.redact(force=True)."""
+        client = FakeClient()
+        client.set_stderr_tail([
+            "ERROR: provider auth failed",
+            "Authorization: Bearer sk-live-deadbeefdeadbeef",
+            "url=https://api.example.com/v1?token=querysecret12345",
+        ])
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        def boom(method, params):
+            if method == "turn/start":
+                raise CodexAppServerError(code=-32603, message="Internal error")
+            return {"thread": {"id": "t"}, "activePermissionProfile": {"id": "x"}}
+
+        client._request_handler = boom
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=2.0)
+        assert r.error is not None
+        assert "turn/start failed" in r.error
+        assert "Internal error" in r.error
+        # Stderr tail attached
+        assert "codex stderr" in r.error
+        assert "provider auth failed" in r.error
+        # Secrets redacted
+        assert "sk-live-deadbeefdeadbeef" not in r.error
+        assert "querysecret12345" not in r.error
+        # Non-OAuth → should NOT retire (subprocess JSON-RPC is still healthy).
+        assert r.should_retire is False
+
+    def test_turn_start_timeout_attaches_redacted_stderr_tail(self):
+        """A non-OAuth TimeoutError on turn/start surfaces with codex stderr
+        context attached and marks the session for retirement."""
+        client = FakeClient()
+        client.set_stderr_tail([
+            "WARN: provider request stalled",
+            "Authorization: Bearer sk-stalled-secret-abc123",
+        ])
+
+        def stall(method, params):
+            if method == "turn/start":
+                raise TimeoutError("codex method 'turn/start' timed out after 10s")
+            return {"thread": {"id": "t"}, "activePermissionProfile": {"id": "x"}}
+
+        client._request_handler = stall
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=2.0)
+        assert r.error is not None
+        assert "turn/start timed out" in r.error
+        assert "provider request stalled" in r.error
+        assert "sk-stalled-secret-abc123" not in r.error
+        assert r.should_retire is True
+
+    def test_startup_failure_returns_error_with_stderr(self):
+        """Codex thread/start failures during ensure_started() used to bubble
+        up as uncaught exceptions. Now they return a TurnResult.error so
+        AIAgent surfaces a clean diagnostic instead of crashing the turn."""
+        client = FakeClient()
+        client.set_stderr_tail([
+            "FATAL: model_provider 'azure_foundry' not configured",
+        ])
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        def boom(method, params):
+            if method == "thread/start":
+                raise CodexAppServerError(code=-32603, message="Internal error")
+            return {}
+
+        client._request_handler = boom
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=2.0)
+        assert r.error is not None
+        assert "startup failed" in r.error
+        assert "model_provider 'azure_foundry' not configured" in r.error
+        assert r.should_retire is True
+        assert r.final_text == ""
+
     def test_interrupt_during_turn_issues_turn_interrupt(self):
         client = FakeClient()
         # Don't queue turn/completed — the loop has to interrupt out
@@ -284,33 +354,6 @@ class TestRunTurn:
         s = make_session(client)
         r = s.run_turn("x", turn_timeout=1.0)
         assert r.error and "model error" in r.error
-
-    def test_context_compaction_notification_emits_status_event(self):
-        client = FakeClient()
-        client.queue_notification(
-            "contextCompaction",
-            threadId="thread-fake-001",
-            beforeTokens=331700,
-            afterTokens=108200,
-        )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
-        events = []
-        s = make_session(client, on_event=events.append)
-        r = s.run_turn("x", turn_timeout=1.0)
-        assert r.error is None
-        status_events = [
-            e for e in events
-            if e.get("method") == "hermes/status"
-            and (e.get("params") or {}).get("source") == "codex_app_server"
-        ]
-        assert status_events
-        assert (
-            status_events[0]["params"]["message"]
-            == "Codex app-server context compacted (331700 -> 108200 tokens)."
-        )
 
 
 # ---- approval bridge ----
@@ -801,61 +844,6 @@ class TestSessionRetirement:
         assert r.should_retire is True
         # Stderr-derived auth hint takes precedence over generic message
         assert r.error and "codex login" in r.error
-
-    def test_startup_initialize_timeout_returns_retirement_result(self):
-        """If startup hangs during initialize, run_turn should return a
-        partial retirement result instead of throwing past run_agent. The
-        caller can then close the session and respawn on the next turn."""
-        client = FakeClient()
-
-        def timeout_initialize(**kwargs):
-            raise TimeoutError(
-                "codex app-server method 'initialize' timed out after 10.0s"
-            )
-
-        client.initialize = timeout_initialize  # type: ignore[method-assign]
-        s = make_session(client)
-
-        r = s.run_turn("hi", turn_timeout=1.0)
-
-        assert r.interrupted is True
-        assert r.should_retire is True
-        assert r.error is not None
-        assert "initialize" in r.error
-        assert "timed out" in r.error
-
-    def test_broken_pipe_while_interrupting_preserves_timeout_error(self):
-        """If the child dies before the timeout cleanup interrupt, the
-        BrokenPipe from turn/interrupt must not replace the original
-        turn timeout. This is the live failure signature from Hermes logs."""
-        client = FakeClient()
-
-        def request_with_broken_interrupt(method, params):
-            if method == "turn/interrupt":
-                raise RuntimeError(
-                    "codex app-server stdin closed unexpectedly: "
-                    "[Errno 32] Broken pipe"
-                )
-            if method == "thread/start":
-                return {"thread": {"id": "t"}}
-            if method == "turn/start":
-                return {"turn": {"id": "tu1"}}
-            return {}
-
-        client._request_handler = request_with_broken_interrupt
-        s = make_session(client)
-
-        r = s.run_turn(
-            "never finishes",
-            turn_timeout=0.05,
-            notification_poll_timeout=0.01,
-        )
-
-        assert r.interrupted is True
-        assert r.should_retire is True
-        assert r.error is not None
-        assert "turn timed out" in r.error
-        assert "Broken pipe" not in r.error
 
 
 # ---- thread/start cross-fill ----

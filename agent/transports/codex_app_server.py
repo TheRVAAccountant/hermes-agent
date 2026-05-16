@@ -173,31 +173,15 @@ class CodexAppServerClient:
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
+        self._send({"id": rid, "method": method, "params": params or {}})
         try:
-            self._send({"id": rid, "method": method, "params": params or {}})
-        except Exception:
+            msg = q.get(timeout=timeout)
+        except queue.Empty:
             with self._pending_lock:
                 self._pending.pop(rid, None)
-            raise
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                with self._pending_lock:
-                    self._pending.pop(rid, None)
-                if not self.is_alive():
-                    raise RuntimeError(self._subprocess_exit_message(method))
-                raise TimeoutError(
-                    f"codex app-server method {method!r} timed out after {timeout}s"
-                )
-            try:
-                msg = q.get(timeout=min(remaining, 0.05))
-                break
-            except queue.Empty:
-                if not self.is_alive():
-                    with self._pending_lock:
-                        self._pending.pop(rid, None)
-                    raise RuntimeError(self._subprocess_exit_message(method))
+            raise TimeoutError(
+                f"codex app-server method {method!r} timed out after {timeout}s"
+            )
         if "error" in msg:
             err = msg["error"]
             raise CodexAppServerError(
@@ -264,15 +248,6 @@ class CodexAppServerClient:
         rid = self._next_id
         self._next_id += 1
         return rid
-
-    def _subprocess_exit_message(self, method: str) -> str:
-        tail = "\n".join(self.stderr_tail(20))
-        rc = self._proc.poll()
-        detail = f": {tail[-500:]}" if tail else ""
-        return (
-            f"codex app-server subprocess exited while waiting for "
-            f"{method!r} (returncode={rc}){detail}"
-        )
 
     def _send(self, obj: dict) -> None:
         if self._closed:

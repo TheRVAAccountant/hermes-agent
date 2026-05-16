@@ -98,7 +98,6 @@ class TestResolveCommand:
         assert resolve_command("background").name == "background"
         assert resolve_command("copy").name == "copy"
         assert resolve_command("agents").name == "agents"
-        assert resolve_command("codex-compact").name == "codex-compact"
 
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"
@@ -109,7 +108,6 @@ class TestResolveCommand:
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
         assert resolve_command("tasks").name == "agents"
-        assert resolve_command("ccompact").name == "codex-compact"
 
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")

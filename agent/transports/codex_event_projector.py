@@ -52,37 +52,6 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
-def _format_context_compaction_status(params: dict) -> str:
-    """Format Codex app-server compaction telemetry for Hermes status output.
-
-    Codex has changed this notification shape across builds, so keep the
-    formatter permissive: any recognizable before/after token counts are
-    included, otherwise the UI still gets a concrete lifecycle signal.
-    """
-    before = _first_present(
-        params,
-        "beforeTokens",
-        "inputTokensBefore",
-        "previousTokens",
-    )
-    after = _first_present(
-        params,
-        "afterTokens",
-        "inputTokensAfter",
-        "currentTokens",
-    )
-    if before is not None and after is not None:
-        return f"Codex app-server context compacted ({before} -> {after} tokens)."
-    return "Codex app-server context compacted."
-
-
-def _first_present(params: dict, *keys: str) -> Any:
-    for key in keys:
-        if key in params:
-            return params[key]
-    return None
-
-
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -95,7 +64,6 @@ class ProjectionResult:
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
     final_text: Optional[str] = None  # Set when an agentMessage completes
-    status_text: Optional[str] = None  # Display-only lifecycle/status text
 
 
 class CodexEventProjector:
@@ -112,11 +80,6 @@ class CodexEventProjector:
         only `item/completed` and `turn/completed` materialize messages."""
         method = notification.get("method", "")
         params = notification.get("params", {}) or {}
-
-        if method == "contextCompaction":
-            return ProjectionResult(
-                status_text=_format_context_compaction_status(params)
-            )
 
         # We only materialize messages on `item/completed`. Streaming deltas
         # (`item/<type>/outputDelta`, `item/<type>/delta`) are display-only and

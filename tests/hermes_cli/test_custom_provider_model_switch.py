@@ -262,35 +262,6 @@ class TestCustomProviderModelSwitch:
         assert config["custom_providers"][0]["key_env"] == "EXAMPLE_PROVIDER_API_KEY"
         assert "sk-live-example-provider" not in config_path.read_text()
 
-    def test_named_custom_starts_server_action_before_model_probe(self, config_home):
-        from hermes_cli.main import _model_flow_named_custom
-
-        calls = []
-        provider_info = {
-            "name": "local-mlx-qwen36-jangtq4",
-            "base_url": "http://localhost:8093/v1",
-            "api_key": "no-key-required",
-            "model": "/Users/jeroncrooks/Qwen3.6-35B-A3B-JANGTQ4",
-            "server_action": "qwen36jangtq",
-        }
-
-        def fake_start(action):
-            calls.append(("start", action))
-
-        def fake_fetch(*args, **kwargs):
-            calls.append(("fetch", args, kwargs))
-            return ["/Users/jeroncrooks/Qwen3.6-35B-A3B-JANGTQ4"]
-
-        with patch("hermes_cli.local_model_servers.start_server_action", side_effect=fake_start), \
-             patch("hermes_cli.models.fetch_api_models", side_effect=fake_fetch), \
-             patch.dict("sys.modules", {"simple_term_menu": None}), \
-             patch("builtins.input", return_value="1"), \
-             patch("builtins.print"):
-            _model_flow_named_custom({}, provider_info)
-
-        assert calls[0] == ("start", "qwen36jangtq")
-        assert calls[1][0] == "fetch"
-
     def test_env_ref_base_url_preserves_api_key_ref_through_picker(
         self, config_home, monkeypatch
     ):

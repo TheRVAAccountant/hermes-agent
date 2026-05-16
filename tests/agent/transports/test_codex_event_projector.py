@@ -72,19 +72,6 @@ class TestProjectionInvariants:
         r = p.project({"method": "totally/unknown", "params": {}})
         assert r.messages == []
 
-    def test_context_compaction_projects_status_without_messages(self) -> None:
-        p = CodexEventProjector()
-        r = p.project({
-            "method": "contextCompaction",
-            "params": {"beforeTokens": 331700, "afterTokens": 108200},
-        })
-        assert r.messages == []
-        assert r.is_tool_iteration is False
-        assert r.final_text is None
-        assert r.status_text == (
-            "Codex app-server context compacted (331700 -> 108200 tokens)."
-        )
-
 
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""

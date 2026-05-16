@@ -69,20 +69,6 @@ class TestApiModeAccepted:
         agent = _make_codex_agent()
         assert agent.api_mode == "codex_app_server"
 
-    def test_manual_compact_requires_active_codex_runtime(self):
-        agent = run_agent.AIAgent(
-            api_key="stub",
-            base_url="https://stub.invalid",
-            provider="openai",
-            api_mode="chat_completions",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        ok, message = agent.compact_codex_app_server()
-        assert ok is False
-        assert "not active" in message
-
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -245,39 +231,6 @@ class TestRunConversationCodexPath:
         ):
             agent.run_conversation("hi")
         assert not client_mock.chat.completions.create.called
-
-    def test_manual_compact_targets_active_session(self, fake_session, monkeypatch):
-        calls = []
-
-        def fake_compact(self):
-            calls.append(self)
-            return {"ok": True}
-
-        monkeypatch.setattr(CodexAppServerSession, "compact_thread", fake_compact)
-        agent = _make_codex_agent()
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            agent.run_conversation("start the codex thread")
-
-        ok, message = agent.compact_codex_app_server()
-
-        assert ok is True
-        assert message == "Codex app-server compaction requested."
-        assert calls == [agent._codex_session]
-
-    def test_context_compaction_status_event_is_emitted(self):
-        agent = _make_codex_agent()
-        emitted = []
-        agent.status_callback = lambda kind, message: emitted.append((kind, message))
-
-        agent._handle_codex_app_server_event({
-            "method": "hermes/status",
-            "params": {
-                "source": "codex_app_server",
-                "message": "Codex app-server context compacted.",
-            },
-        })
-
-        assert ("lifecycle", "Codex app-server context compacted.") in emitted
 
 
 class TestReviewForkApiModeDowngrade:
