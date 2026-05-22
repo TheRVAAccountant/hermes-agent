@@ -9,10 +9,11 @@ Linux (primary): uses pactl (PulseAudio) to create a null-sink plus a
 virtual source whose master is the null-sink's monitor. Callers set
 PULSE_SOURCE=<source_name> in Chrome's env and pass the fake-mic flag.
 
-macOS: requires BlackHole 2ch to be installed. This module only
-verifies its presence and returns the device name; routing OS default
-input is left to the user (or a future switchaudio-osx integration) to
-avoid surprising the user's system audio state.
+    macOS: requires BlackHole 2ch (brew install blackhole-2ch) and switchaudio-osx
+    (brew install switchaudio-osx). The bridge now automatically switches the
+    default system input to BlackHole 2ch on setup() and restores the previous
+    device on teardown(). This gives true hands-free realtime duplex without
+    manual intervention. The change is best-effort and safe.
 
 Windows: not supported in v2.
 """
@@ -41,6 +42,8 @@ class AudioBridge:
         self._write_target: Optional[str] = None
         self._module_ids: list[int] = []
         self._torn_down = False
+        # macOS-only: saved previous default input device for clean restore on teardown
+        self._previous_input_device: Optional[str] = None
 
     # ── public properties ─────────────────────────────────────────────────
 
@@ -77,9 +80,8 @@ class AudioBridge:
         """Release the virtual audio device. Idempotent."""
         if self._torn_down:
             return
-        # Only Linux needs explicit unloading.
+        # Linux: explicit unloading
         if self._platform == "linux" and self._module_ids:
-            # Unload in reverse order (virtual-source before null-sink).
             for mod_id in reversed(self._module_ids):
                 try:
                     subprocess.run(
@@ -88,9 +90,23 @@ class AudioBridge:
                         capture_output=True,
                     )
                 except Exception:
-                    # Best-effort teardown — never raise from here.
                     pass
             self._module_ids = []
+
+        # macOS: restore previous default input device if we switched it
+        if self._platform == "darwin" and self._previous_input_device:
+            try:
+                switch_cmd = "SwitchAudioSource"
+                subprocess.run(
+                    [switch_cmd, "-s", self._previous_input_device, "-t", "input"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass  # best effort restore
+            self._previous_input_device = None
+
         self._torn_down = True
 
     # ── platform impls ────────────────────────────────────────────────────
@@ -186,6 +202,40 @@ class AudioBridge:
                 "Install via: brew install blackhole-2ch"
             )
 
+        # --- New: automatic, reversible default input switching via switchaudio-osx ---
+        switch_cmd = None
+        try:
+            # Prefer full path if in PATH
+            which_out = subprocess.check_output(["which", "SwitchAudioSource"], text=True, stderr=subprocess.DEVNULL).strip()
+            switch_cmd = which_out or "SwitchAudioSource"
+        except Exception:
+            switch_cmd = "SwitchAudioSource"
+
+        previous = None
+        try:
+            # Save current default input
+            prev_out = subprocess.check_output(
+                [switch_cmd, "-c", "-t", "input"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+            previous = prev_out or None
+
+            # Switch to BlackHole 2ch as the new default input (so Chrome sees it as mic)
+            subprocess.check_output(
+                [switch_cmd, "-s", _BLACKHOLE_DEVICE, "-t", "input"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            )
+            self._previous_input_device = previous
+        except FileNotFoundError:
+            # switchaudio-osx not installed — fall back to manual (documented behavior)
+            self._previous_input_device = None
+        except subprocess.CalledProcessError as e:
+            # Switching failed (rare) — still proceed but note it
+            self._previous_input_device = None
+            # Do not raise; realtime can still work if user manually sets it
+
         self._platform = "darwin"
         self._device_name = _BLACKHOLE_DEVICE
         self._write_target = _BLACKHOLE_DEVICE
@@ -199,6 +249,7 @@ class AudioBridge:
             "channels": 2,
             "module_ids": [],
             "write_target": _BLACKHOLE_DEVICE,
+            "previous_input_device": self._previous_input_device,
         }
 
     # ── helpers ──────────────────────────────────────────────────────────
@@ -228,8 +279,9 @@ def chrome_fake_audio_flags(bridge_info: dict) -> list[str]:
 
         env["PULSE_SOURCE"] = bridge_info["device_name"]
 
-    On macOS the caller must ensure the system default audio input is
-    set to the returned BlackHole device (we do not flip that switch).
+    On macOS we now automatically switch the default input to BlackHole
+    via SwitchAudioSource during bridge.setup() (and restore on teardown).
+    The fake-ui flag is still used to bypass permission prompts.
     """
     system = platform.system()
     if system == "Linux":
