@@ -63,6 +63,8 @@ class CommandDef:
 
 COMMAND_REGISTRY: list[CommandDef] = [
     # Session
+    CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
+               gateway_only=True),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
@@ -764,6 +766,47 @@ def _collect_gateway_skill_entries(
     return all_entries[:max_slots], hidden_count
 
 
+def _collect_gateway_quick_command_entries(
+    platform: str,
+    reserved_names: set[str],
+    desc_limit: int = 100,
+    sanitize_name: "Callable[[str], str] | None" = None,
+) -> list[tuple[str, str]]:
+    """Collect config-defined quick commands explicitly opted into platform menus."""
+    try:
+        from .config import read_raw_config
+        cfg = read_raw_config()
+    except Exception:
+        return []
+
+    quick_commands = cfg.get("quick_commands", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(quick_commands, dict):
+        return []
+
+    entries: list[tuple[str, str]] = []
+    platform_flag = f"{platform}_menu"
+    for raw_name, meta in sorted(quick_commands.items()):
+        if not isinstance(raw_name, str) or not isinstance(meta, dict):
+            continue
+        if not is_truthy_value(meta.get(platform_flag), default=False):
+            continue
+        if meta.get("type") not in {"exec", "alias"}:
+            continue
+
+        name = raw_name.strip().lstrip("/")
+        name = sanitize_name(name) if sanitize_name else name
+        if not name:
+            continue
+
+        description = str(meta.get("description") or meta.get("desc") or f"Run /{raw_name}")
+        if len(description) > desc_limit:
+            description = description[:desc_limit - 3] + "..."
+        entries.append((name, description))
+
+    clamped = _clamp_command_names(entries, reserved_names)
+    return [(name, description) for name, description, *_extra in clamped]
+
+
 # ---------------------------------------------------------------------------
 # Platform-specific wrappers
 # ---------------------------------------------------------------------------
@@ -772,11 +815,11 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """Return Telegram menu commands capped to the Bot API limit.
 
     Priority order (higher priority = never bumped by overflow):
-      1. Core CommandDef commands (always included)
-      2. Plugin slash commands (take precedence over skills)
-      3. Built-in skill commands (fill remaining slots, alphabetical)
+      1. Pinned core CommandDef commands
+      2. Config-defined quick commands with ``telegram_menu: true``
+      3. Remaining core/plugin commands
+      4. Built-in skill commands (fill remaining slots, alphabetical)
 
-    Skills are the only tier that gets trimmed when the cap is hit.
     User-installed hub skills are excluded — accessible via /skills.
     Skills disabled for the ``"telegram"`` platform (via ``hermes skills
     config``) are excluded from the menu entirely.
@@ -787,7 +830,20 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """
     core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
     reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
+    quick_commands = _collect_gateway_quick_command_entries(
+        platform="telegram",
+        reserved_names=reserved_names,
+        desc_limit=40,
+        sanitize_name=_sanitize_telegram_name,
+    )
+    reserved_names.update(n for n, _ in quick_commands)
+
+    priority_names = {
+        _sanitize_telegram_name(name) for name in _TELEGRAM_MENU_PRIORITY
+    }
+    pinned_core = [cmd for cmd in core_commands if cmd[0] in priority_names]
+    remaining_core = [cmd for cmd in core_commands if cmd[0] not in priority_names]
+    all_commands = [*pinned_core, *quick_commands, *remaining_core]
     hidden_core_count = max(0, len(all_commands) - max_commands)
 
     remaining_slots = max(0, max_commands - len(all_commands))

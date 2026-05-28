@@ -975,6 +975,39 @@ class TestTelegramMenuCommands:
         ):
             assert name in names
 
+    def test_opted_in_quick_commands_survive_thirty_command_cap(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "quick_commands:\n"
+            "  tesla_ready:\n"
+            "    type: exec\n"
+            "    command: /bin/true\n"
+            "    description: Tesla readiness check\n"
+            "    telegram_menu: true\n"
+            "  tesla_unlock:\n"
+            "    type: exec\n"
+            "    command: /bin/true\n"
+            "    description: Unlock Tesla\n"
+            "    telegram_menu: false\n"
+            "  hidden_helper:\n"
+            "    type: exec\n"
+            "    command: /bin/true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        menu, hidden = telegram_menu_commands(max_commands=30)
+        names = [name for name, _desc in menu]
+        descriptions = dict(menu)
+
+        assert len(names) == 30
+        assert hidden > 0
+        assert "tesla_ready" in names
+        assert descriptions["tesla_ready"] == "Tesla readiness check"
+        assert "tesla_unlock" not in names
+        assert "hidden_helper" not in names
+        assert "help" in names
+        assert "new" in names
+        assert "status" in names
+
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""
         from unittest.mock import patch
