@@ -113,6 +113,10 @@
           "description": ""
         },
         {
+          "id": "z-ai/glm-5.3",
+          "description": ""
+        },
+        {
           "id": "z-ai/glm-5.2",
           "description": "default",
           "default": true
@@ -245,6 +249,9 @@
         },
         {
           "id": "minimax/minimax-m3"
+        },
+        {
+          "id": "z-ai/glm-5.3"
         },
         {
           "id": "z-ai/glm-5.2",
