@@ -55,6 +55,16 @@ class TestParseModelInput:
         assert provider == "openrouter"
         assert model == "anthropic/claude-sonnet-4.5"
 
+    def test_space_separated_provider_and_model(self):
+        provider, model = parse_model_input("zai glm-5.3", "kimi-coding")
+        assert provider == "zai"
+        assert model == "glm-5.3"
+
+    def test_colon_provider_and_model(self):
+        provider, model = parse_model_input("zai:glm-5.3", "kimi-coding")
+        assert provider == "zai"
+        assert model == "glm-5.3"
+
 
 # -- curated_models_for_provider ---------------------------------------------
 

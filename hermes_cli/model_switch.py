@@ -491,6 +491,33 @@ class ModelFlagParseResult:
 # Flag parsing
 # ---------------------------------------------------------------------------
 
+def _is_known_model_provider(name: str) -> bool:
+    """True when *name* is a canonical provider slug or alias.
+
+    Used to interpret ``/model zai glm-5.3`` as provider + model. User-config
+    slugs from ``providers:`` are included when config is readable so named
+    endpoints (``openrouter-glm52``) also split.
+    """
+    token = (name or "").strip().lower()
+    if not token:
+        return False
+    try:
+        from hermes_cli.models import _KNOWN_PROVIDER_NAMES
+        if token in _KNOWN_PROVIDER_NAMES:
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        providers = cfg.get("providers") or {}
+        if isinstance(providers, dict) and token in {str(k).strip().lower() for k in providers}:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """Parse flags from /model command args.
 
@@ -513,6 +540,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         "--provider my-ollama"           -> ("", "my-ollama", False, False, False)
         "--refresh"                      -> ("", "", False, True, False)
         "sonnet --provider anthropic --global" -> ("sonnet", "anthropic", True, False, False)
+        "zai glm-5.3"                    -> ("glm-5.3", "zai", False, False, False)
     """
     is_global = False
     explicit_provider = ""
@@ -551,6 +579,14 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
             i += 1
 
     model_input = " ".join(filtered).strip()
+    # Space form: `/model zai glm-5.3` is provider + model, not one name.
+    # Only split when --provider was not already given and the first token
+    # is a known provider slug or alias. A single token stays a model name.
+    if not explicit_provider and len(filtered) >= 2:
+        maybe_provider = filtered[0].strip().lower()
+        if maybe_provider and _is_known_model_provider(maybe_provider):
+            explicit_provider = maybe_provider
+            model_input = " ".join(filtered[1:]).strip()
     return ModelFlagParseResult(
         model_input=model_input,
         explicit_provider=explicit_provider,
@@ -708,9 +744,9 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
       → ``MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET``
 
     Model targets pass through untouched: bare names (``sonnet``),
-    aggregator slugs (``vendor/model``), and colon forms (``vendor:model``)
-    are all resolved later by :func:`switch_model` (aggregator-aware — bare
-    names resolve WITHIN the current aggregator first).
+    aggregator slugs (``vendor/model``), colon forms (``vendor:model``),
+    and space-separated ``provider model`` when the first token is a known
+    provider. Remaining names are resolved later by :func:`switch_model`.
     """
     raw = str(raw or "")
     parsed = parse_model_flags_detailed(raw)

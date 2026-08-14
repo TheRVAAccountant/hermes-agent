@@ -2455,10 +2455,12 @@ def list_available_providers() -> list[dict[str, str]]:
 def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     """Parse ``/model`` input into ``(provider, model)``.
 
-    Supports ``provider:model`` syntax to switch providers at runtime::
+    Supports ``provider:model`` and ``provider model`` syntax to switch
+    providers at runtime::
 
         openrouter:anthropic/claude-sonnet-4.5  →  ("openrouter", "anthropic/claude-sonnet-4.5")
         nous:hermes-3                           →  ("nous", "hermes-3")
+        zai glm-5.3                             →  ("zai", "glm-5.3")
         anthropic/claude-sonnet-4.5             →  (current_provider, "anthropic/claude-sonnet-4.5")
         gpt-5.4                                 →  (current_provider, "gpt-5.4")
 
@@ -2470,6 +2472,14 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     provider from the input or *current_provider* if none was specified.
     """
     stripped = raw.strip()
+    # Space form: "zai glm-5.3" → ("zai", "glm-5.3") when the first token
+    # is a known provider. Colon form below still wins for "zai:glm-5.3".
+    space = stripped.find(" ")
+    if space > 0 and ":" not in stripped[:space]:
+        provider_part = stripped[:space].strip().lower()
+        model_part = stripped[space + 1:].strip()
+        if provider_part and model_part and provider_part in _KNOWN_PROVIDER_NAMES:
+            return (normalize_provider(provider_part), model_part)
     colon = stripped.find(":")
     if colon > 0:
         provider_part = stripped[:colon].strip().lower()

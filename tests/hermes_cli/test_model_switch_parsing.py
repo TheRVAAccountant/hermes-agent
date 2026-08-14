@@ -36,6 +36,38 @@ def test_provider_flag_and_scopes():
     assert req.scope == "global"
     assert req.errors == ()
 
+
+def test_space_separated_provider_and_model():
+    """Telegram/CLI users type `/model zai glm-5.3`; that is provider + model."""
+    req = parse_model_switch_args("zai glm-5.3")
+    assert req.target == "glm-5.3"
+    assert req.explicit_provider == "zai"
+    assert req.errors == ()
+
+    flagged = parse_model_switch_args("zai glm-5.3 --global")
+    assert flagged.target == "glm-5.3"
+    assert flagged.explicit_provider == "zai"
+    assert flagged.is_global is True
+
+    alias = parse_model_switch_args("glm glm-5.3")
+    assert alias.target == "glm-5.3"
+    assert alias.explicit_provider == "glm"
+
+    # --provider still wins; leftover tokens stay the model name.
+    explicit = parse_model_switch_args("glm-5.3 --provider zai")
+    assert explicit.target == "glm-5.3"
+    assert explicit.explicit_provider == "zai"
+
+    # A single token is still a model name, even if it matches a provider slug.
+    bare = parse_model_switch_args("zai")
+    assert bare.target == "zai"
+    assert bare.explicit_provider == ""
+
+    # Unknown first token is not a provider split (model names stay intact).
+    unknown = parse_model_switch_args("not-a-provider glm-5.3")
+    assert unknown.target == "not-a-provider glm-5.3"
+    assert unknown.explicit_provider == ""
+
     assert parse_model_switch_args("sonnet --session").scope == "session"
     assert parse_model_switch_args("sonnet --once").scope == "once"
     assert parse_model_switch_args("--refresh").force_refresh is True
