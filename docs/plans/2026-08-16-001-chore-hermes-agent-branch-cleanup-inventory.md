@@ -2,16 +2,16 @@
 
 Date: 2026-08-16
 Checkout: this `hermes-agent` worktree
-HEAD at inventory write: `chore/hermes-agent-branch-cleanup` @ `bab7be3ca`
-Shallow: yes
+HEAD at inventory write: `chore/hermes-agent-branch-cleanup` @ `5dbd1d784`
+Shallow: yes (deepen of `origin/main` stopped at `--depth=500`)
 
 ## Main vs remotes
 
 | Ref | Tip | Note |
 |---|---|---|
-| `main` | `bab7be3ca` | Local-ahead Codex OAuth 900K commit. Do not drop. |
-| `origin/main` | `f0ab10455` | `fmt(js): npm run fix on merge (#88079)` |
-| `main...origin/main` | 1 ahead, 1 behind | Cannot fast-forward. Do not rebase or merge onto `main` in this run. |
+| `main` | `c0f89d254` | Fast-forwarded to `origin/main` after fetch. Still contains `bab7be3ca`. |
+| `origin/main` | `c0f89d254` | Equal to local `main` after U2. |
+| `main...origin/main` | 0 ahead, 0 behind | Fast-forward only. No merge commit. No drop of `bab7be3ca`. |
 
 `origin` = `https://github.com/NousResearch/hermes-agent.git`
 `fork` = `https://github.com/TheRVAAccountant/hermes-agent.git`
@@ -56,8 +56,8 @@ Labels: `contained` | `needs-history` | `experimental` | `worktree-hold` | `ship
 
 | Branch | Tip | Merge-base with `main` | Label | Disposition |
 |---|---|---|---|---|
-| `main` | `bab7be3ca` | self | land-target (diverged) | Preserve local-ahead commit. Not equal to `origin/main`. |
-| `chore/hermes-agent-branch-cleanup` | `bab7be3ca` | `bab7be3ca` | experimental | This-run execution branch. Do not merge onto `main` unless the operator later says yes. |
+| `main` | `c0f89d254` | self | land-target | Equals `origin/main`. Contains `bab7be3ca`. |
+| `chore/hermes-agent-branch-cleanup` | `5dbd1d784` | `bab7be3ca` | experimental | This-run execution branch. Do not merge onto `main` unless the operator later says yes. |
 | `park/2026-08-16-host-experiments` | `c37eb4e8b` | `bab7be3ca` | experimental | Never-land. Holds host experiments and dirty MCP OAuth edits. |
 | `chore/cron-profile-assignment` | `bc60f1b41` | none | worktree-hold + needs-history | Held by sibling worktree `hermes-agent-pr-55870`. Unique chain `bc60f1b41` → `2228c2e6c` → `14c4a849b` (parent missing). |
 | `cursor/glm-5-3-zai-6531` | `4c4c84b38` | none | experimental + needs-history | `/model` space form. Unique chain `4c4c84b38` → `cd87a95dd` → `3cf8293e4` (parent missing). |
@@ -66,7 +66,20 @@ Labels: `contained` | `needs-history` | `experimental` | `worktree-hold` | `ship
 | `fix/cfo-zai-glm-5-3` | `c896c09c4` | none | needs-history | Desktop spawn. Shallow-root; parent missing. |
 | `fix/remote-cron-profile-scope` | `082b73182` | none | needs-history | Desktop cron routing. Unique chain `082b73182` → `7e8f50a14` (parent missing). |
 
-No row is `shippable`. No row is `contained`.
+No row is `shippable`. No feature tip is `contained` after the `main` fast-forward.
+
+## U2 deepen result
+
+Fetched `origin main` only (no pull, no `--unshallow`, no `--deepen`, no `cli.py` `_deepen_shallow_repo`).
+
+| Depth | `origin/main` tip | Feature merge-bases vs `main` |
+|---|---|---|
+| before | `f0ab10455` (count 1) | none |
+| `--depth=50` | `8dc427949` (count 50) | none |
+| `--depth=200` | `c0f89d254` (count 308) | none |
+| `--depth=500` | `c0f89d254` (count 637) | none |
+
+Deepen refused. Missing-parent SHAs still have no parent objects. No cherry-pick. No land. Park branch not landed.
 
 ## Missing-parent SHAs (do not cherry-pick)
 
@@ -80,7 +93,7 @@ No row is `shippable`. No row is `contained`.
 
 | Path | HEAD | Branch | Status |
 |---|---|---|---|
-| this checkout | `bab7be3ca` | `chore/hermes-agent-branch-cleanup` | Primary. Untracked: this-run plan, `outputs/`. |
+| this checkout | `5dbd1d784` | `chore/hermes-agent-branch-cleanup` | Primary. Untracked: this-run plan, `outputs/`. |
 | `../hermes-agent-pr-55870` | `bc60f1b41` | `chore/cron-profile-assignment` | Clean. Do not force-delete the branch while this worktree holds it. |
 
 ## Stage A
