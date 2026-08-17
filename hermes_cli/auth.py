@@ -4530,41 +4530,86 @@ def _pool_codex_access_token() -> str:
 # xAI Grok OAuth — tokens stored in ~/.hermes/auth.json
 # =============================================================================
 
-def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return usable xAI OAuth state from provider state or credential pool."""
-    state = _load_provider_state(auth_store, "xai-oauth")
-    tokens = state.get("tokens") if isinstance(state, dict) else None
-    if isinstance(tokens, dict):
-        access_token = str(tokens.get("access_token", "") or "").strip()
-        refresh_token = str(tokens.get("refresh_token", "") or "").strip()
-        if access_token and refresh_token:
-            return state
+def _xai_oauth_access_is_live(state: Optional[Dict[str, Any]]) -> bool:
+    """True when *state* has a non-expired access token (JWT ``exp`` in the future).
 
+    Non-JWT access tokens are treated as live: ``_xai_access_token_is_expiring``
+    cannot read an ``exp`` claim from them and returns False.
+    """
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if not isinstance(tokens, dict):
+        return False
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    return bool(access_token) and not _xai_access_token_is_expiring(access_token, 0)
+
+
+def _xai_oauth_pool_states(
+    auth_store: Dict[str, Any], base_state: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Materialize credential-pool xAI rows that still have both token fields."""
     credential_pool = auth_store.get("credential_pool")
     entries = (
         credential_pool.get("xai-oauth")
         if isinstance(credential_pool, dict)
         else None
     )
-    if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            access_token = str(entry.get("access_token", "") or "").strip()
-            refresh_token = str(entry.get("refresh_token", "") or "").strip()
-            if not access_token or not refresh_token:
-                continue
-            merged = dict(state or {})
-            merged["tokens"] = {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "token_type": str(entry.get("token_type") or "Bearer"),
-            }
-            if entry.get("last_refresh"):
-                merged["last_refresh"] = entry.get("last_refresh")
-            merged.setdefault("auth_mode", "oauth_pkce")
-            return merged
+    if not isinstance(entries, list):
+        return []
+    states: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        access_token = str(entry.get("access_token", "") or "").strip()
+        refresh_token = str(entry.get("refresh_token", "") or "").strip()
+        if not access_token or not refresh_token:
+            continue
+        merged = dict(base_state or {})
+        merged["tokens"] = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": str(entry.get("token_type") or "Bearer"),
+        }
+        if entry.get("last_refresh"):
+            merged["last_refresh"] = entry.get("last_refresh")
+        merged.setdefault("auth_mode", "oauth_pkce")
+        states.append(merged)
+    return states
 
+
+def _pick_preferred_xai_oauth_state(
+    candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Prefer a non-expired access token; otherwise the newest ``last_refresh``."""
+    if not candidates:
+        return None
+    live = [state for state in candidates if _xai_oauth_access_is_live(state)]
+    pool = live or candidates
+    return max(pool, key=lambda state: str(state.get("last_refresh") or ""))
+
+
+def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return usable xAI OAuth state from provider state or credential pool.
+
+    A live (non-expired) credential-pool grant wins over an expired
+    singleton. The Telegram ``/model`` picker already leases via
+    ``credential_pool.select()``; the switch path used to refresh the
+    first singleton/pool row instead, which races a rotated SuperGrok
+    grant into ``invalid_grant`` when an older revoked row is still
+    present (empty-token quarantine + dead pool head).
+    """
+    state = _load_provider_state(auth_store, "xai-oauth")
+    preferred_pool = _pick_preferred_xai_oauth_state(
+        _xai_oauth_pool_states(auth_store, state if isinstance(state, dict) else None)
+    )
+    singleton_usable = _xai_oauth_state_has_usable_tokens(state)
+    if singleton_usable and _xai_oauth_access_is_live(state):
+        return state
+    if preferred_pool and _xai_oauth_access_is_live(preferred_pool):
+        return preferred_pool
+    if singleton_usable:
+        return state
+    if preferred_pool is not None:
+        return preferred_pool
     return state if isinstance(state, dict) else None
 
 
